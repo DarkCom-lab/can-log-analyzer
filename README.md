@@ -4,6 +4,14 @@ CAN Log Analyzer Pro is a desktop engineering tool for exploring Controller Area
 
 The project started as a focused CAN log analysis application and was later extended with an interactive 3D vehicle scene. The 3D view is linked to the CAN playback timeline, so decoded signals can be observed both as charts and as visible vehicle motion.
 
+## Demo
+
+Watch the application in action:
+
+[▶️ Watch the CAN Log Analyzer 3D demo](./demo.mp4)
+
+The demo shows the CAN analysis workflow together with the synchronized 3D vehicle visualization.
+
 ## What the application does
 
 - Loads and inspects CAN trace data.
