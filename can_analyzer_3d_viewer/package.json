@@ -1,0 +1,15 @@
+{
+  "name": "can-analyzer-embedded-vehicle-viewer",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Offline-bundled Three.js viewer embedded in the PyQt5 CAN Log Analyzer",
+  "scripts": {
+    "build": "esbuild viewer.js --bundle --format=iife --target=chrome80 --outfile=viewer.bundle.js"
+  },
+  "dependencies": {
+    "three": "0.180.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  }
+}
