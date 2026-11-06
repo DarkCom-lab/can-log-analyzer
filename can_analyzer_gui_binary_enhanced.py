@@ -10,7 +10,10 @@ Professional CAN Log Analyzer – PyQt5 GUI with all enhancements:
 - Collapsible dashboard, dark/light theme
 """
 
-import sys, re, os, csv
+import sys, re, os, csv, json, shutil, threading
+from functools import partial
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+from urllib.parse import urlsplit
 from typing import Dict, List, Tuple
 from collections import namedtuple
 from datetime import datetime
@@ -22,8 +25,16 @@ from PyQt5.QtWidgets import (
     QLineEdit, QCheckBox, QToolBar, QStatusBar, QMenu, QStyle, QFrame,
     QScrollArea, QAbstractItemView
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QRect, QSize
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QRect, QSize, QUrl
 from PyQt5.QtGui import QFont, QColor, QBrush, QPalette, QIcon
+
+try:
+    from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineSettings
+    WEBENGINE_AVAILABLE = True
+except ImportError:
+    QWebEngineView = None
+    QWebEngineSettings = None
+    WEBENGINE_AVAILABLE = False
 import xml.etree.ElementTree as ET
 
 import matplotlib
@@ -33,6 +44,35 @@ from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as Navigatio
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 import numpy as np
+
+###############################################################################
+# Embedded 3D viewer helpers
+###############################################################################
+def resource_path(relative_path: str) -> str:
+    """Resolve assets both in source mode and in a PyInstaller bundle."""
+    base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
+
+
+class VehicleViewerRequestHandler(SimpleHTTPRequestHandler):
+    """Serve viewer files locally and expose the user's selected GLB at /vehicle.glb."""
+    def __init__(self, *args, directory=None, model_path_getter=None, **kwargs):
+        self.model_path_getter = model_path_getter
+        super().__init__(*args, directory=directory, **kwargs)
+
+    def translate_path(self, path):
+        parsed_path = urlsplit(path).path
+        if parsed_path == "/vehicle.glb":
+            model_path = self.model_path_getter() if self.model_path_getter else None
+            if model_path and os.path.isfile(model_path):
+                return model_path
+            return os.path.join(self.directory or os.getcwd(), "__vehicle_model_not_selected__.glb")
+        return super().translate_path(path)
+
+    def log_message(self, format, *args):
+        # Avoid writing a line for every viewer asset request to the console.
+        pass
+
 
 ###############################################################################
 # Data structures & parsing (unchanged)
@@ -239,6 +279,38 @@ def classify_state(signal_name: str, interpreted: str) -> str:
     binary = interpret_to_binary(signal_name, interpreted)
     return "high" if binary == 1 else "low"
 
+
+# Signal names below are already referenced by this application's dashboard.
+# Assumed vehicle layout: left = driver side, right = passenger side.
+VEHICLE_SIGNAL_TO_PART = {
+    "drd_status": "front-left",
+    "drd_status_cont": "front-left",
+    "psd_status": "front-right",
+    "psd_status_cont": "front-right",
+    "drdr_status": "rear-left",
+    "drdr_status_cont": "rear-left",
+    "psdr_status": "rear-right",
+    "psdr_status_cont": "rear-right",
+    "bootlid_status": "trunk",
+    "bootlid_status_cont": "trunk",
+}
+VEHICLE_PART_KEYS = ("front-left", "front-right", "rear-left", "rear-right", "trunk")
+
+
+def vehicle_panel_state_from_text(interpreted: str):
+    """Return True=open, False=closed, or None when the text is not an explicit state."""
+    text = str(interpreted or "").strip().lower().replace("_", " ")
+    if not text or "unknown" in text or "invalid" in text:
+        return None
+    # Check negative/closed expressions first so 'not open' is not misread.
+    closed_words = ("closed", "close", "shut", "not open", "ajar false")
+    if any(word in text for word in closed_words):
+        return False
+    open_words = ("opened", "open", "ajar", "unlatched")
+    if any(word in text for word in open_words):
+        return True
+    return None
+
 ###############################################################################
 # Custom widget: LED indicator
 ###############################################################################
@@ -315,12 +387,23 @@ class CanAnalyzerGUI(QMainWindow):
         self.binary_plot_data: List[Dict[str, int]] = []
         self.anomaly_flags: List[Dict[str, bool]] = []   # True if signal value is invalid/unknown
         self.signal_names_for_plot = []
+        self.vehicle_state_snapshots = []
+        self._vehicle_page_loaded = False
+        self._vehicle_pending_states = {key: None for key in VEHICLE_PART_KEYS}
+        self._vehicle_viewer_server = None
+        self._vehicle_viewer_thread = None
+        self.vehicle_web_view = None
+        self._vehicle_model_path = None
+        app_data_root = os.environ.get("LOCALAPPDATA", os.path.join(os.path.expanduser("~"), "AppData", "Local"))
+        self._vehicle_model_dir = os.path.join(app_data_root, "CAN Log Analyzer Pro", "models")
+        os.makedirs(self._vehicle_model_dir, exist_ok=True)
+        self._vehicle_model_path = os.path.join(self._vehicle_model_dir, "vehicle.glb")
 
         # Dashboard labels + LEDs
         self.dash_widgets: Dict[str, Tuple[QLabel, LEDIndicator, QLabel]] = {}  # name -> (name_label, led, value_label)
 
         self.build_ui()
-        self.setStyleSheet(self.light_theme())
+        self.apply_theme()
 
     def build_ui(self):
         central = QWidget()
@@ -406,36 +489,228 @@ class CanAnalyzerGUI(QMainWindow):
         slider_layout.addWidget(self.timeline_label)
         left_layout.addLayout(slider_layout)
 
-        # ---- Right: Dashboard (collapsible) ----
+        # ---- Right: signal dashboard + full-height embedded 3D scene ----
         self.dash_panel = QWidget()
-        dash_scroll = QScrollArea()
-        dash_scroll.setWidgetResizable(True)
-        dash_content = QWidget()
-        dash_layout = QVBoxLayout(dash_content)
-        self.dash_group = QGroupBox("Signal Status")
-        self.dash_grid = QGridLayout()
-        self.dash_group.setLayout(self.dash_grid)
-        dash_layout.addWidget(self.dash_group)
-        self.req_label = QLabel("Requirement: not checked yet")
-        self.req_label.setFont(QFont("Arial", 12, QFont.Bold))
-        dash_layout.addWidget(self.req_label)
-        dash_layout.addStretch()
-        dash_scroll.setWidget(dash_content)
-        # Collapse button
+        self.dash_panel.setMinimumWidth(390)
+        self.dash_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        dash_panel_layout = QVBoxLayout(self.dash_panel)
+        dash_panel_layout.setContentsMargins(6, 6, 6, 6)
+        dash_panel_layout.setSpacing(7)
+
+        # GLB loading and dashboard collapse controls stay at the top.
+        panel_header = QHBoxLayout()
+        self.load_vehicle_model_btn = QPushButton("Load GLB Model…")
+        self.load_vehicle_model_btn.setToolTip("Select or replace the animated vehicle model")
+        self.load_vehicle_model_btn.clicked.connect(self.load_vehicle_model)
+        panel_header.addWidget(self.load_vehicle_model_btn)
+        panel_header.addStretch(1)
+
         self.dash_visible = True
         self.toggle_dash_btn = QPushButton("◀ Collapse")
         self.toggle_dash_btn.clicked.connect(self.toggle_dashboard)
-        dash_layout.insertWidget(0, self.toggle_dash_btn)
-        dash_panel_layout = QVBoxLayout(self.dash_panel)
-        dash_panel_layout.addWidget(dash_scroll)
+        panel_header.addWidget(self.toggle_dash_btn)
+        dash_panel_layout.addLayout(panel_header, 0)
+
+        # Keep the signal grid compact at the top of the panel.
+        self.dash_group = QGroupBox("Signal Status")
+        self.dash_group.setObjectName("signalStatusGroup")
+        self.dash_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        self.dash_grid = QGridLayout()
+        self.dash_grid.setContentsMargins(8, 12, 8, 7)
+        self.dash_grid.setHorizontalSpacing(8)
+        self.dash_grid.setVerticalSpacing(3)
+        self.dash_group.setLayout(self.dash_grid)
+        dash_panel_layout.addWidget(self.dash_group, 0)
+
+        self.req_label = QLabel("Requirement: not checked yet")
+        self.req_label.setObjectName("requirementStatus")
+        self.req_label.setFont(QFont("Arial", 12, QFont.Bold))
+        self.req_label.setWordWrap(True)
+        self.req_label.setMinimumHeight(34)
+        self.req_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        dash_panel_layout.addWidget(self.req_label, 0)
+
+        # The 3D scene receives all remaining vertical space below Requirement Status.
+        # There is deliberately no extra status-label row or stretch after the viewer.
+        self.vehicle_scene_group = QGroupBox("3D Vehicle Scene")
+        self.vehicle_scene_group.setObjectName("vehicleSceneGroup")
+        self.vehicle_scene_group.setMinimumHeight(0)
+        self.vehicle_scene_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        vehicle_scene_layout = QVBoxLayout(self.vehicle_scene_group)
+        vehicle_scene_layout.setContentsMargins(4, 8, 4, 4)
+        vehicle_scene_layout.setSpacing(0)
+
+        self.vehicle_web_view = None
+        self._build_embedded_vehicle_viewer(vehicle_scene_layout, self.vehicle_scene_group)
+        dash_panel_layout.addWidget(self.vehicle_scene_group, 1)
 
         splitter.addWidget(left_widget)
         splitter.addWidget(self.dash_panel)
-        splitter.setSizes([1000, 300])
+        splitter.setChildrenCollapsible(False)
+        splitter.setSizes([1020, 440])
+
+        # Keep the original single-page CAN Analysis workspace; the 3D scene is
+        # integrated into its right dashboard rather than opened as a second tab.
         main_layout.addWidget(splitter)
 
         self.statusBar().showMessage("Ready. Load catalogues and trace to begin.")
         self.build_dashboard()
+
+    # ---- Embedded 3D vehicle viewer ----
+    def _start_vehicle_viewer_server(self):
+        if self._vehicle_viewer_server is not None:
+            return
+        viewer_dir = resource_path("can_analyzer_3d_viewer")
+        if not os.path.isdir(viewer_dir):
+            raise FileNotFoundError(f"3D viewer assets not found: {viewer_dir}")
+        handler = partial(
+            VehicleViewerRequestHandler,
+            directory=viewer_dir,
+            model_path_getter=lambda: self._vehicle_model_path
+        )
+        self._vehicle_viewer_server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self._vehicle_viewer_server.daemon_threads = True
+        self._vehicle_viewer_thread = threading.Thread(
+            target=self._vehicle_viewer_server.serve_forever,
+            name="CANVehicleViewerHTTP",
+            daemon=True
+        )
+        self._vehicle_viewer_thread.start()
+        self._vehicle_viewer_url = f"http://127.0.0.1:{self._vehicle_viewer_server.server_address[1]}/index.html"
+
+    def _set_vehicle_status(self, message):
+        """Report viewer state in the Qt status bar without taking scene space."""
+        if hasattr(self, "statusBar"):
+            self.statusBar().showMessage(str(message), 6000)
+
+    def _build_embedded_vehicle_viewer(self, layout, parent):
+        """Insert an expanding 3D scene below Requirement Status."""
+        if not WEBENGINE_AVAILABLE:
+            message = QLabel(
+                "The 3D scene requires PyQtWebEngine.\n"
+                "Install it with: python -m pip install PyQtWebEngine"
+            )
+            message.setObjectName("vehicleViewerMessage")
+            message.setAlignment(Qt.AlignCenter)
+            message.setWordWrap(True)
+            message.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            layout.addWidget(message, 1)
+            self.load_vehicle_model_btn.setEnabled(False)
+            self._set_vehicle_status("3D viewer unavailable: PyQtWebEngine is not installed.")
+            return
+
+        viewer_dir = resource_path("can_analyzer_3d_viewer")
+        viewer_bundle = os.path.join(viewer_dir, "viewer.bundle.js")
+        if not os.path.isfile(viewer_bundle):
+            message = QLabel(
+                "The Three.js viewer bundle has not been built yet.\n"
+                "Run .\\prepare_threejs_viewer.ps1 from the project folder."
+            )
+            message.setObjectName("vehicleViewerMessage")
+            message.setAlignment(Qt.AlignCenter)
+            message.setWordWrap(True)
+            message.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            layout.addWidget(message, 1)
+            self.load_vehicle_model_btn.setEnabled(False)
+            self._set_vehicle_status("Viewer bundle missing. Build the local Three.js bundle first.")
+            return
+
+        try:
+            self._start_vehicle_viewer_server()
+            self.vehicle_web_view = QWebEngineView(parent)
+            self.vehicle_web_view.setMinimumSize(0, 0)
+            self.vehicle_web_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            settings = self.vehicle_web_view.settings()
+            settings.setAttribute(QWebEngineSettings.JavascriptEnabled, True)
+            settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
+            self.vehicle_web_view.loadFinished.connect(self._on_vehicle_page_loaded)
+            self.vehicle_web_view.setUrl(QUrl(self._vehicle_viewer_url))
+            layout.addWidget(self.vehicle_web_view, 1)
+            if os.path.isfile(self._vehicle_model_path):
+                self._set_vehicle_status("Previously selected GLB found. Loading it into the scene…")
+            else:
+                self._set_vehicle_status("Load an animated .glb model to display the vehicle.")
+        except Exception as exc:
+            self.vehicle_web_view = None
+            self.load_vehicle_model_btn.setEnabled(False)
+            message = QLabel("Could not initialize the 3D viewer: " + str(exc))
+            message.setObjectName("vehicleViewerMessage")
+            message.setWordWrap(True)
+            message.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            layout.addWidget(message, 1)
+            self._set_vehicle_status("3D viewer initialization failed.")
+
+    def _on_vehicle_page_loaded(self, ok):
+        self._vehicle_page_loaded = bool(ok)
+        if not ok:
+            self._set_vehicle_status(
+                "The 3D vehicle scene could not load. Check the bundled viewer assets and PyQtWebEngine installation."
+            )
+            return
+        if os.path.isfile(self._vehicle_model_path):
+            self._load_vehicle_model_into_page()
+        self.update_vehicle_view(self._vehicle_pending_states)
+
+    def load_vehicle_model(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select animated vehicle model", "",
+            "glTF Binary Model (*.glb);;All Files (*)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".glb"):
+            QMessageBox.warning(self, "Unsupported model", "Please select a binary glTF .glb file.")
+            return
+        try:
+            os.makedirs(self._vehicle_model_dir, exist_ok=True)
+            shutil.copy2(path, self._vehicle_model_path)
+            self._set_vehicle_status(f"Model selected: {os.path.basename(path)}")
+            if self._vehicle_page_loaded:
+                self._load_vehicle_model_into_page()
+            else:
+                QMessageBox.information(
+                    self, "Model saved",
+                    "The GLB model has been saved. It will load when the 3D viewer page is ready."
+                )
+        except Exception as exc:
+            QMessageBox.critical(self, "GLB load error", f"Could not copy the model:\n{exc}")
+
+    def _load_vehicle_model_into_page(self):
+        if not self.vehicle_web_view or not self._vehicle_page_loaded:
+            return
+        payload = json.dumps(self._vehicle_pending_states)
+        js = (
+            "window.loadVehicleModel && window.loadVehicleModel("
+            "'/vehicle.glb?cache=' + Date.now(), " + payload + ");"
+        )
+        self.vehicle_web_view.page().runJavaScript(js)
+        self._set_vehicle_status("Loading animated GLB model into the CAN Analysis dashboard…")
+
+    def update_vehicle_view(self, states):
+        """Send cumulative door/trunk states derived from the current trace position."""
+        self._vehicle_pending_states = {key: states.get(key) for key in VEHICLE_PART_KEYS}
+        if self.vehicle_web_view and self._vehicle_page_loaded:
+            payload = json.dumps(self._vehicle_pending_states)
+            self.vehicle_web_view.page().runJavaScript(
+                f"window.setCanStates && window.setCanStates({payload});"
+            )
+
+    def reset_vehicle_view(self):
+        self._vehicle_pending_states = {key: None for key in VEHICLE_PART_KEYS}
+        if self.vehicle_web_view and self._vehicle_page_loaded:
+            self.vehicle_web_view.page().runJavaScript(
+                "window.resetVehicleView && window.resetVehicleView();"
+            )
+
+    def closeEvent(self, event):
+        try:
+            if self._vehicle_viewer_server is not None:
+                self._vehicle_viewer_server.shutdown()
+                self._vehicle_viewer_server.server_close()
+                self._vehicle_viewer_server = None
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     # ---- Dashboard with LEDs ----
     def build_dashboard(self):
@@ -532,6 +807,8 @@ class CanAnalyzerGUI(QMainWindow):
     def compute_binary_data(self):
         self.binary_plot_data = []
         self.anomaly_flags = []
+        self.vehicle_state_snapshots = []
+        vehicle_state = {key: None for key in VEHICLE_PART_KEYS}
         all_sigs = set()
         for tl in self.trace:
             bin_dict = {}
@@ -545,8 +822,15 @@ class CanAnalyzerGUI(QMainWindow):
                     bin_dict[sig_name] = binary
                     anom_dict[sig_name] = ("invalid" in interpreted.lower() or "unknown" in interpreted.lower())
                     all_sigs.add(sig_name)
+                    part_key = VEHICLE_SIGNAL_TO_PART.get(sig_name.lower())
+                    if part_key:
+                        panel_state = vehicle_panel_state_from_text(interpreted)
+                        if panel_state is not None:
+                            vehicle_state[part_key] = panel_state
             self.binary_plot_data.append(bin_dict)
             self.anomaly_flags.append(anom_dict)
+            # Snapshot the latest known status of every panel at this trace index.
+            self.vehicle_state_snapshots.append(dict(vehicle_state))
         interest = [
             "door_latche_status", "selective_unlock_statuss",
             "Drd_Status", "PSD_Status", "DRDR_Status", "Psdr_Status",
@@ -560,10 +844,12 @@ class CanAnalyzerGUI(QMainWindow):
 
     def initialize_plot(self):
         self.plot_canvas.ax.clear()
+        self.plot_canvas.cursor_annotation = None
         times = [tl.timestamp for tl in self.trace]
         if not self.signal_names_for_plot:
             self.plot_canvas.ax.text(0.5, 0.5, "No signals found",
                                      transform=self.plot_canvas.ax.transAxes, ha='center', va='center')
+            self.apply_plot_theme()
             self.plot_canvas.draw()
             return
 
@@ -606,6 +892,7 @@ class CanAnalyzerGUI(QMainWindow):
 
         # Connect hover event for cursor annotation
         self.plot_canvas.mpl_connect('motion_notify_event', self.on_plot_hover)
+        self.apply_plot_theme()
         self.plot_canvas.draw()
 
     def on_plot_hover(self, event):
@@ -632,6 +919,7 @@ class CanAnalyzerGUI(QMainWindow):
         # Position annotation near cursor
         self.plot_canvas.ax.set_title("")  # avoid title clutter
         self.plot_canvas.set_cursor_annotation(text)
+        self.apply_plot_theme()
 
     def update_plot_cursor(self):
         if self.current_index < 0 or self.current_index >= len(self.trace):
@@ -662,8 +950,19 @@ class CanAnalyzerGUI(QMainWindow):
                 has_anomaly = any("invalid" in v['interpreted'].lower() or "unknown" in v['interpreted'].lower()
                                   for v in decoded.values())
                 if has_anomaly:
+                    # Keep anomaly rows readable in both themes while preserving
+                    # their warning emphasis.
+                    if getattr(self, "dark_mode", False):
+                        anomaly_bg = QColor("#5a451b")
+                        anomaly_fg = QColor("#fff0c2")
+                    else:
+                        anomaly_bg = QColor("#fff2b3")
+                        anomaly_fg = QColor("#5c4211")
                     for col in range(8):
-                        self.table.item(i, col).setBackground(QColor(255, 255, 0))  # yellow
+                        cell = self.table.item(i, col)
+                        if cell is not None:
+                            cell.setBackground(anomaly_bg)
+                            cell.setForeground(anomaly_fg)
             else:
                 self.table.setItem(i, 6, QTableWidgetItem("Unknown"))
                 self.table.setItem(i, 7, QTableWidgetItem(""))
@@ -709,6 +1008,7 @@ class CanAnalyzerGUI(QMainWindow):
         self.req_label.setText("Requirement: not checked yet")
         self.req_label.setStyleSheet("")
         self.table.clearSelection()
+        self.reset_vehicle_view()
         if hasattr(self, 'cursor_line'):
             self.cursor_line.set_xdata([0])
             self.plot_canvas.draw_idle()
@@ -734,6 +1034,7 @@ class CanAnalyzerGUI(QMainWindow):
         self.req_label.setText("Requirement: not checked yet")
         self.req_label.setStyleSheet("")
         self.table.clearSelection()
+        self.reset_vehicle_view()
         if hasattr(self, 'cursor_line'):
             self.cursor_line.set_xdata([0])
             self.plot_canvas.draw_idle()
@@ -795,6 +1096,8 @@ class CanAnalyzerGUI(QMainWindow):
             msg_def = self.msg_defs[tl.can_id]
             decoded = decode_message(tl.data_bytes, msg_def)
             self.update_dashboard_leds(decoded)
+        if self.current_index < len(self.vehicle_state_snapshots):
+            self.update_vehicle_view(self.vehicle_state_snapshots[self.current_index])
 
     def highlight_row(self, idx):
         self.table.selectRow(idx)
@@ -848,40 +1151,287 @@ class CanAnalyzerGUI(QMainWindow):
         if not self.trace or not self.car_cat or not self.key_cat:
             return
         passed, details = analyze_securing_requirement(self.trace, self.car_cat, self.key_cat)
-        if passed:
-            self.req_label.setText("REQUIREMENT: PASSED")
-            self.req_label.setStyleSheet("color: green; font-size: 14px;")
-        else:
-            self.req_label.setText("REQUIREMENT: FAILED")
-            self.req_label.setStyleSheet("color: red; font-size: 14px;")
+        self.req_label.setText("REQUIREMENT: PASSED" if passed else "REQUIREMENT: FAILED")
+        self.apply_requirement_status_theme()
         QMessageBox.information(self, "Requirement Result", details)
 
     # ---- Dashboard collapse ----
     def toggle_dashboard(self):
         self.dash_visible = not self.dash_visible
-        self.dash_panel.setVisible(self.dash_visible)
+        self.dash_group.setVisible(self.dash_visible)
         self.toggle_dash_btn.setText("◀ Collapse" if self.dash_visible else "▶ Expand")
 
     # ---- Dark/Light theme ----
     def light_theme(self):
         return """
-        QMainWindow { background-color: #f0f0f0; }
-        QTableWidget { background-color: white; alternate-background-color: #f9f9f9; gridline-color: #ddd; }
-        QLineEdit, QPushButton, QSlider, QLabel { }
+        QMainWindow, QWidget {
+            background-color: #f3f5f7;
+            color: #26323b;
+        }
+        QToolBar {
+            background: #e8edf1;
+            border: 0;
+            border-bottom: 1px solid #cbd4da;
+            spacing: 5px;
+            padding: 5px;
+        }
+        QToolBar::separator { background: #c8d1d7; width: 1px; margin: 4px 6px; }
+        QToolButton, QPushButton {
+            background: #ffffff;
+            color: #26323b;
+            border: 1px solid #c7d1d8;
+            border-radius: 4px;
+            padding: 5px 9px;
+        }
+        QToolButton:hover, QPushButton:hover { background: #e9f0f4; border-color: #94aab7; }
+        QToolButton:pressed, QPushButton:pressed { background: #dce6ec; }
+        QToolButton:disabled, QPushButton:disabled { color: #9aa5ac; background: #edf0f2; }
+        QLineEdit {
+            background: #ffffff; color: #26323b;
+            border: 1px solid #c7d1d8; border-radius: 4px; padding: 5px 7px;
+            selection-background-color: #b8d4e5;
+        }
+        QLineEdit:focus { border: 1px solid #668fa6; }
+        QSlider::groove:horizontal { height: 5px; background: #cbd5dc; border-radius: 2px; }
+        QSlider::sub-page:horizontal { background: #739cb2; border-radius: 2px; }
+        QSlider::handle:horizontal { background: #ffffff; border: 1px solid #8299a6; width: 13px; margin: -5px 0; border-radius: 6px; }
+        QTableWidget, QTreeWidget, QListWidget {
+            background: #ffffff; alternate-background-color: #f2f5f7;
+            color: #26323b; gridline-color: #d9e0e5;
+            border: 1px solid #cbd4da; selection-background-color: #c9dfed;
+            selection-color: #1e2b34;
+        }
+        QTableWidget::item { padding: 3px; }
+        QHeaderView::section {
+            background: #e7edf1; color: #34434d;
+            border: 0; border-right: 1px solid #cbd4da;
+            border-bottom: 1px solid #cbd4da; padding: 5px;
+        }
+        QTableCornerButton::section { background: #e7edf1; border: 0; }
+        QGroupBox {
+            background: #f8fafb; color: #26323b;
+            border: 1px solid #cbd5dc; border-radius: 5px;
+            margin-top: 9px; padding-top: 5px;
+        }
+        QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }
+        QLabel { background: transparent; color: #26323b; }
+        QLabel#requirementStatus { color: #26323b; padding: 3px 2px; }
+        QLabel#vehicleViewerMessage {
+            background: #eef2f5; color: #42525e;
+            border: 1px dashed #b8c6cf; border-radius: 4px; padding: 18px;
+        }
+        QScrollArea { background: #f3f5f7; border: 0; }
+        QScrollBar:vertical { background: #edf1f4; width: 12px; margin: 0; }
+        QScrollBar::handle:vertical { background: #bdc9d1; min-height: 24px; border-radius: 5px; }
+        QScrollBar::handle:vertical:hover { background: #9fadb7; }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        QScrollBar:horizontal { background: #edf1f4; height: 12px; margin: 0; }
+        QScrollBar::handle:horizontal { background: #bdc9d1; min-width: 24px; border-radius: 5px; }
+        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+        QMenu { background: #ffffff; color: #26323b; border: 1px solid #cbd4da; padding: 4px; }
+        QMenu::item { padding: 5px 24px 5px 20px; }
+        QMenu::item:selected { background: #e2edf3; color: #1e2b34; }
+        QStatusBar { background: #e8edf1; color: #43525d; border-top: 1px solid #cbd4da; }
+        QStatusBar::item { border: 0; }
+        QSplitter::handle { background: #d4dde2; }
+        QSplitter::handle:hover { background: #9eb2be; }
+        QToolTip { background: #fffbe8; color: #27333b; border: 1px solid #c8bd91; padding: 4px; }
         """
+
     def dark_theme(self):
         return """
-        QMainWindow { background-color: #2d2d2d; color: #ddd; }
-        QTableWidget { background-color: #3c3c3c; color: #ddd; gridline-color: #555; }
-        QLineEdit { background-color: #555; color: white; }
-        QPushButton { background-color: #444; color: white; }
-        QLabel { color: #ddd; }
-        QGroupBox { color: #ddd; border: 1px solid #555; }
+        QMainWindow, QWidget {
+            background-color: #202831;
+            color: #e0e7ec;
+        }
+        QToolBar {
+            background: #18212a;
+            border: 0;
+            border-bottom: 1px solid #394651;
+            spacing: 5px;
+            padding: 5px;
+        }
+        QToolBar::separator { background: #43515c; width: 1px; margin: 4px 6px; }
+        QToolButton, QPushButton {
+            background: #303c47;
+            color: #e0e7ec;
+            border: 1px solid #4a5965;
+            border-radius: 4px;
+            padding: 5px 9px;
+        }
+        QToolButton:hover, QPushButton:hover { background: #3a4b58; border-color: #718999; }
+        QToolButton:pressed, QPushButton:pressed { background: #26343e; }
+        QToolButton:disabled, QPushButton:disabled { color: #77848d; background: #28323a; border-color: #36424b; }
+        QLineEdit {
+            background: #151d25; color: #e0e7ec;
+            border: 1px solid #465560; border-radius: 4px; padding: 5px 7px;
+            selection-background-color: #42677d;
+        }
+        QLineEdit:focus { border: 1px solid #83a9bd; }
+        QSlider::groove:horizontal { height: 5px; background: #485661; border-radius: 2px; }
+        QSlider::sub-page:horizontal { background: #78a9c0; border-radius: 2px; }
+        QSlider::handle:horizontal { background: #dce6ec; border: 1px solid #8199a7; width: 13px; margin: -5px 0; border-radius: 6px; }
+        QTableWidget, QTreeWidget, QListWidget {
+            background: #18212a; alternate-background-color: #202b35;
+            color: #dfe7ec; gridline-color: #394752;
+            border: 1px solid #3e4c57; selection-background-color: #36576b;
+            selection-color: #ffffff;
+        }
+        QTableWidget::item { padding: 3px; }
+        QHeaderView::section {
+            background: #2a3742; color: #d7e0e6;
+            border: 0; border-right: 1px solid #46545f;
+            border-bottom: 1px solid #46545f; padding: 5px;
+        }
+        QTableCornerButton::section { background: #2a3742; border: 0; }
+        QGroupBox {
+            background: #242f39; color: #e0e7ec;
+            border: 1px solid #43515c; border-radius: 5px;
+            margin-top: 9px; padding-top: 5px;
+        }
+        QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }
+        QLabel { background: transparent; color: #dce4e9; }
+        QLabel#requirementStatus { color: #e0e7ec; padding: 3px 2px; }
+        QLabel#vehicleViewerMessage {
+            background: #18232c; color: #c8d5dc;
+            border: 1px dashed #536471; border-radius: 4px; padding: 18px;
+        }
+        QScrollArea { background: #202831; border: 0; }
+        QScrollBar:vertical { background: #202a33; width: 12px; margin: 0; }
+        QScrollBar::handle:vertical { background: #4a5964; min-height: 24px; border-radius: 5px; }
+        QScrollBar::handle:vertical:hover { background: #647783; }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        QScrollBar:horizontal { background: #202a33; height: 12px; margin: 0; }
+        QScrollBar::handle:horizontal { background: #4a5964; min-width: 24px; border-radius: 5px; }
+        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+        QMenu { background: #252f38; color: #e0e7ec; border: 1px solid #4a5964; padding: 4px; }
+        QMenu::item { padding: 5px 24px 5px 20px; }
+        QMenu::item:selected { background: #3b5362; color: #ffffff; }
+        QStatusBar { background: #18212a; color: #b9c6ce; border-top: 1px solid #394651; }
+        QStatusBar::item { border: 0; }
+        QSplitter::handle { background: #34434e; }
+        QSplitter::handle:hover { background: #6d8796; }
+        QToolTip { background: #303b44; color: #f2f5f7; border: 1px solid #6a7b86; padding: 4px; }
         """
+
+    def apply_plot_theme(self):
+        """Theme the Matplotlib canvas and annotations; the WebGL scene is separate."""
+        if not hasattr(self, "plot_canvas"):
+            return
+        if self.dark_mode:
+            figure_bg, axes_bg = "#202831", "#18212a"
+            text_color, spine_color, grid_color = "#d7e0e6", "#62727d", "#46545f"
+            annotation_bg, annotation_edge = "#303c47", "#71828d"
+        else:
+            figure_bg, axes_bg = "#f3f5f7", "#ffffff"
+            text_color, spine_color, grid_color = "#26323b", "#aab6be", "#d9e0e5"
+            annotation_bg, annotation_edge = "#fffbe8", "#c8bd91"
+
+        fig = self.plot_canvas.fig
+        ax = self.plot_canvas.ax
+        fig.patch.set_facecolor(figure_bg)
+        ax.set_facecolor(axes_bg)
+        ax.tick_params(axis="both", colors=text_color, labelcolor=text_color)
+        ax.xaxis.label.set_color(text_color)
+        ax.yaxis.label.set_color(text_color)
+        ax.title.set_color(text_color)
+        for spine in ax.spines.values():
+            spine.set_color(spine_color)
+        ax.grid(True, color=grid_color, linestyle=":", alpha=0.65)
+        for item in ax.texts:
+            item.set_color(text_color)
+        annotation = getattr(self.plot_canvas, "cursor_annotation", None)
+        if annotation is not None:
+            annotation.set_color(text_color)
+            patch = annotation.get_bbox_patch()
+            if patch is not None:
+                patch.set_facecolor(annotation_bg)
+                patch.set_edgecolor(annotation_edge)
+                patch.set_alpha(0.95)
+        self.plot_canvas.draw_idle()
+
+    def apply_theme(self):
+        """Apply the selected theme to all Qt UI layers, not the 3D WebGL page."""
+        stylesheet = self.dark_theme() if self.dark_mode else self.light_theme()
+        self.setStyleSheet(stylesheet)
+
+        palette = QPalette()
+        if self.dark_mode:
+            colors = {
+                QPalette.Window: "#202831", QPalette.WindowText: "#e0e7ec",
+                QPalette.Base: "#18212a", QPalette.AlternateBase: "#202b35",
+                QPalette.ToolTipBase: "#303b44", QPalette.ToolTipText: "#f2f5f7",
+                QPalette.Text: "#dfe7ec", QPalette.Button: "#303c47",
+                QPalette.ButtonText: "#e0e7ec", QPalette.BrightText: "#ffffff",
+                QPalette.Highlight: "#36576b", QPalette.HighlightedText: "#ffffff",
+                QPalette.Link: "#8dbbd1", QPalette.Light: "#53616b",
+                QPalette.Mid: "#43515c", QPalette.Dark: "#151d25",
+                QPalette.Shadow: "#10161c"
+            }
+        else:
+            colors = {
+                QPalette.Window: "#f3f5f7", QPalette.WindowText: "#26323b",
+                QPalette.Base: "#ffffff", QPalette.AlternateBase: "#f2f5f7",
+                QPalette.ToolTipBase: "#fffbe8", QPalette.ToolTipText: "#27333b",
+                QPalette.Text: "#26323b", QPalette.Button: "#ffffff",
+                QPalette.ButtonText: "#26323b", QPalette.BrightText: "#111820",
+                QPalette.Highlight: "#c9dfed", QPalette.HighlightedText: "#1e2b34",
+                QPalette.Link: "#326d8b", QPalette.Light: "#ffffff",
+                QPalette.Mid: "#cbd4da", QPalette.Dark: "#d7dfe4",
+                QPalette.Shadow: "#aeb8bf"
+            }
+        for role, color in colors.items():
+            palette.setColor(role, QColor(color))
+        app = QApplication.instance()
+        if app is not None:
+            app.setPalette(palette)
+        self.setPalette(palette)
+        self.apply_requirement_status_theme()
+        self.apply_anomaly_row_theme()
+        self.apply_plot_theme()
+
+    def apply_requirement_status_theme(self):
+        """Keep PASS/FAIL text legible after every light/dark theme switch."""
+        if not hasattr(self, "req_label"):
+            return
+        text = self.req_label.text().upper()
+        if "PASSED" in text:
+            color = "#79d69a" if self.dark_mode else "#16803d"
+            self.req_label.setStyleSheet(f"color: {color}; font-size: 14px;")
+        elif "FAILED" in text:
+            color = "#ff8585" if self.dark_mode else "#c62828"
+            self.req_label.setStyleSheet(f"color: {color}; font-size: 14px;")
+        else:
+            self.req_label.setStyleSheet("")
+
+    def apply_anomaly_row_theme(self):
+        """Recolor existing anomaly rows when the application theme changes."""
+        if not hasattr(self, "table"):
+            return
+        if self.dark_mode:
+            anomaly_bg = QColor("#5a451b")
+            anomaly_fg = QColor("#fff0c2")
+        else:
+            anomaly_bg = QColor("#fff2b3")
+            anomaly_fg = QColor("#5c4211")
+        for row in range(self.table.rowCount()):
+            flags = self.anomaly_flags[row] if row < len(self.anomaly_flags) else {}
+            is_anomaly = any(flags.values())
+            for col in range(self.table.columnCount()):
+                cell = self.table.item(row, col)
+                if cell is None:
+                    continue
+                if is_anomaly:
+                    cell.setBackground(anomaly_bg)
+                    cell.setForeground(anomaly_fg)
+                else:
+                    # Clear any prior explicit brushes so the current palette/QSS wins.
+                    cell.setBackground(QBrush())
+                    cell.setForeground(QBrush())
 
     def toggle_theme(self):
         self.dark_mode = not self.dark_mode
-        self.setStyleSheet(self.dark_theme() if self.dark_mode else self.light_theme())
+        self.apply_theme()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
