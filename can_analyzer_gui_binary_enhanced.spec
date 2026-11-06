@@ -1,12 +1,29 @@
 # -*- mode: python ; coding: utf-8 -*-
+# Build from this directory with:
+#   python -m PyInstaller --clean --noconfirm can_analyzer_gui_binary_enhanced.spec
+
+from PyInstaller.utils.hooks import collect_submodules
+
+viewer_hiddenimports = [
+    'PyQt5.QtWebEngineWidgets',
+    'PyQt5.QtWebEngineCore',
+    'PyQt5.QtWebChannel',
+]
+
+# PyQtWebEngine's own PyInstaller hooks collect the WebEngine process, Qt
+# resources and platform plugins. These explicit imports help frozen builds.
+try:
+    viewer_hiddenimports += collect_submodules('PyQt5.QtWebEngineWidgets')
+except Exception:
+    pass
 
 
 a = Analysis(
     ['can_analyzer_gui_binary_enhanced.py'],
-    pathex=[],
+    pathex=['.'],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    datas=[('can_analyzer_3d_viewer', 'can_analyzer_3d_viewer')],
+    hiddenimports=viewer_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -26,7 +43,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
