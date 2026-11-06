@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+build/
+dist/
+resultat/
+can_analyzer_3d_viewer/node_modules/
+*.log
+*.tmp
+
+# Local/generated 3D build output
+can_analyzer_3d_viewer/.cache/
